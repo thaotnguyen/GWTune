@@ -2851,7 +2851,7 @@ class AlignRepresentations:
         # Barycenter alignment
         loss_list = []
         embedding_barycenter = init_embedding
-        for i in range(n_iter):
+        for i in tqdm(range(n_iter), desc="Barycenter alignment"):
             embedding_barycenter = self.calc_barycenter(X_init=embedding_barycenter)
 
             loss = 0
@@ -2867,6 +2867,8 @@ class AlignRepresentations:
 
             loss /= len(pairwise_barycenters)
             loss_list.append(loss)
+
+            print(f"Iteration {i+1}/{n_iter} - Mean Wasserstein distance: {loss:.4f}")
 
         plt.figure()
         plt.plot(loss_list)
