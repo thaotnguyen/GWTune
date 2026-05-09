@@ -55,6 +55,7 @@ class OptimizationConfig:
         to_types: str = "numpy",
         data_type: str = "double",
         n_jobs: int = 1,
+        optuna_n_jobs: int = 1,
         multi_gpu: Union[bool, List[int]] = False,
         storage: Optional[str] = None,
         db_params: Optional[Dict[str, Union[str, int]]] = {
@@ -78,6 +79,9 @@ class OptimizationConfig:
             "min_resource": 2,
             "reduction_factor": 3,
         },
+        optuna_early_stopping_patience: Optional[int] = None,
+        optuna_early_stopping_min_trials: int = 15,
+        max_total_trials: Optional[int] = None,
     ) -> None:
         """Initialization of the instance.
 
@@ -127,6 +131,16 @@ class OptimizationConfig:
             pruner_params (dict, optional):
                 Additional parameters for the pruner. See Optuna's pruner page for more details.
                 Defaults to {"n_startup_trials": 1, "n_warmup_steps": 2, "min_resource": 2, "reduction_factor": 3}.
+            optuna_early_stopping_patience (int, optional):
+                If set, stop each pairwise Optuna study after this many consecutive **completed**
+                trials without improving the best GW loss (in addition to trial-level pruning).
+                Defaults to None (disabled).
+            optuna_early_stopping_min_trials (int, optional):
+                Minimum number of completed trials before study-level early stopping can trigger.
+                Defaults to 15.
+            max_total_trials (int, optional):
+                If set, cap each pairwise Optuna study at this many total persisted trial rows.
+                Defaults to None (disabled).
         """
 
         self.gw_type = gw_type
@@ -140,6 +154,7 @@ class OptimizationConfig:
         self.device = device
 
         self.n_jobs = n_jobs
+        self.optuna_n_jobs = optuna_n_jobs
         self.multi_gpu = multi_gpu
 
         self.storage = storage
@@ -160,6 +175,9 @@ class OptimizationConfig:
 
         self.pruner_name = pruner_name
         self.pruner_params = pruner_params
+        self.optuna_early_stopping_patience = optuna_early_stopping_patience
+        self.optuna_early_stopping_min_trials = optuna_early_stopping_min_trials
+        self.max_total_trials = max_total_trials
 
 
 class VisualizationConfig:
@@ -1212,8 +1230,23 @@ class PairwiseAnalysis:
             df_trial = study.trials_dataframe()
             df_trial.to_csv(self.save_path + "/" + self.instance_name + ".csv")
 
-        best_trial = study.best_trial
-        ot_path = glob.glob(self.data_path + f"/gw_{best_trial.number}.*")[0]
+        try:
+            best_trial = study.best_trial
+        except ValueError as e:
+            raise ValueError(
+                f"No completed Optuna trial is available for {self.pair_name}. "
+                "If this study was skipped by max_total_trials with only stale or failed trials, "
+                "archive or delete that pair's result database and rerun it."
+            ) from e
+
+        ot_candidates = glob.glob(self.data_path + f"/gw_{best_trial.number}.*")
+        if not ot_candidates:
+            raise FileNotFoundError(
+                f"No saved OT file found for best trial {best_trial.number} of {self.pair_name}. "
+                "If this study was skipped by max_total_trials using existing DB history, "
+                "archive or delete that pair's result database and rerun it."
+            )
+        ot_path = ot_candidates[0]
 
         if ".npy" in ot_path:
             OT = np.load(ot_path)
@@ -1231,7 +1264,7 @@ class PairwiseAnalysis:
         fix_random_init_seed: bool = False,
         first_random_init_seed: Optional[int] = None,
         *,
-        n_jobs_for_pairwise_analysis: int = 1,
+        n_jobs_for_pairwise_analysis: Optional[int] = None,
     ) -> optuna.study.Study:
         """Run or load an optimization study for Gromov-Wasserstein Optimal Transport (GWOT).
 
@@ -1252,6 +1285,9 @@ class PairwiseAnalysis:
                 The result of the optimization study, typically an instance of a study object.
         """
 
+        if n_jobs_for_pairwise_analysis is None:
+            n_jobs_for_pairwise_analysis = getattr(self.config, "optuna_n_jobs", 1)
+
         # generate instance optimize gw_alignment
         opt = gw_optimizer.load_optimizer(
             save_path=self.save_path,
@@ -1265,6 +1301,9 @@ class PairwiseAnalysis:
             sampler_name=self.config.sampler_name,
             pruner_name=self.config.pruner_name,
             pruner_params=self.config.pruner_params,
+            early_stopping_patience=self.config.optuna_early_stopping_patience,
+            early_stopping_min_trials=self.config.optuna_early_stopping_min_trials,
+            max_total_trials=self.config.max_total_trials,
         )
 
         if compute_OT:
@@ -2746,6 +2785,257 @@ class AlignRepresentations:
 
         return X
 
+    def _resolve_barycenter_gpu_devices(
+        self,
+        gpu_devices: Optional[Union[int, str, List[int], List[str]]] = None,
+    ) -> List[str]:
+        if not torch.cuda.is_available():
+            raise RuntimeError("use_gpu=True requires at least one CUDA device.")
+
+        if gpu_devices is None:
+            if isinstance(self.config.multi_gpu, list):
+                gpu_devices = self.config.multi_gpu
+            elif self.config.multi_gpu is True:
+                gpu_devices = list(range(torch.cuda.device_count()))
+            else:
+                gpu_devices = self.config.device
+
+        if isinstance(gpu_devices, (int, str)):
+            gpu_devices = [gpu_devices]
+
+        resolved_devices = []
+        for device in gpu_devices:
+            if isinstance(device, int):
+                device_name = f"cuda:{device}"
+            elif isinstance(device, str):
+                device_name = device if device.startswith("cuda") else f"cuda:{device}"
+            else:
+                raise ValueError("gpu_devices must be an int, str, or list of ints/strings.")
+
+            device_index = torch.device(device_name).index
+            if device_index is not None and device_index >= torch.cuda.device_count():
+                raise RuntimeError(f"CUDA device {device_name} is not available.")
+            resolved_devices.append(device_name)
+
+        return resolved_devices
+
+    def _barycenter_gpu_dtype(self):
+        if self.config.data_type in ("float", "float32"):
+            return torch.float32
+        return torch.float64
+
+    def _as_barycenter_tensor(self, array, device: str):
+        if isinstance(array, torch.Tensor):
+            return array.to(device=device, dtype=self._barycenter_gpu_dtype())
+        return torch.as_tensor(np.asarray(array), dtype=self._barycenter_gpu_dtype(), device=device)
+
+    def _torch_cost_matrix(self, source, target, metric: str):
+        if metric == "cosine":
+            source_norm = torch.nn.functional.normalize(source, p=2, dim=1, eps=1e-12)
+            target_norm = torch.nn.functional.normalize(target, p=2, dim=1, eps=1e-12)
+            return (1 - torch.matmul(source_norm, target_norm.T)).clamp_min(0)
+        if metric == "euclidean":
+            return torch.cdist(source, target, p=2)
+        if metric in ("sqeuclidean", "squared_euclidean"):
+            return torch.cdist(source, target, p=2).pow(2)
+        raise ValueError(
+            "GPU barycenter alignment supports 'cosine', 'euclidean', and "
+            f"'sqeuclidean' metrics. Got {metric!r}."
+        )
+
+    def _scaled_barycenter_reg(self, cost, gpu_reg: Optional[float], gpu_reg_scale: float) -> float:
+        if gpu_reg is not None:
+            return float(gpu_reg)
+
+        finite_positive = cost[torch.isfinite(cost) & (cost > 0)]
+        if finite_positive.numel() == 0:
+            return float(gpu_reg_scale)
+
+        reg = float(torch.median(finite_positive).detach().cpu()) * float(gpu_reg_scale)
+        return max(reg, torch.finfo(cost.dtype).eps)
+
+    def _sinkhorn_transport_gpu(
+        self,
+        source,
+        target,
+        metric: str,
+        gpu_reg: Optional[float],
+        gpu_reg_scale: float,
+        gpu_numItermax: Optional[int],
+        gpu_stopThr: Optional[float],
+    ):
+        cost = self._torch_cost_matrix(source, target, metric)
+        a = torch.full((source.shape[0],), 1.0 / source.shape[0], dtype=source.dtype, device=source.device)
+        b = torch.full((target.shape[0],), 1.0 / target.shape[0], dtype=target.dtype, device=target.device)
+        reg = self._scaled_barycenter_reg(cost, gpu_reg, gpu_reg_scale)
+        ot_plan = ot.sinkhorn(
+            a,
+            b,
+            cost,
+            reg=reg,
+            method=self.config.sinkhorn_method,
+            numItermax=gpu_numItermax or self.config.numItermax,
+            stopThr=gpu_stopThr if gpu_stopThr is not None else max(self.config.tol, 1e-7),
+        )
+        loss = torch.sum(ot_plan * cost)
+        return ot_plan, loss
+
+    def _calc_barycenter_gpu(
+        self,
+        X_init,
+        gpu_devices: List[str],
+        gpu_reg: Optional[float],
+        gpu_reg_scale: float,
+        gpu_numItermax: Optional[int],
+        gpu_stopThr: Optional[float],
+        gpu_parallel: bool,
+    ):
+        primary_device = gpu_devices[0]
+        barycenter = self._as_barycenter_tensor(X_init, primary_device)
+
+        def barycenter_contribution(index_and_representation):
+            index, representation = index_and_representation
+            device = gpu_devices[index % len(gpu_devices)]
+            with torch.cuda.device(device):
+                source = self._as_barycenter_tensor(representation.embedding, device)
+                target = barycenter.to(device)
+                ot_plan, _ = self._sinkhorn_transport_gpu(
+                    source,
+                    target,
+                    self.metric,
+                    gpu_reg,
+                    gpu_reg_scale,
+                    gpu_numItermax,
+                    gpu_stopThr,
+                )
+                numerator = torch.matmul(ot_plan.T, source)
+                denominator = ot_plan.sum(dim=0).unsqueeze(1).clamp_min(torch.finfo(source.dtype).eps)
+                return numerator.to(primary_device), denominator.to(primary_device)
+
+        indexed_representations = list(enumerate(self.representations_list))
+        if gpu_parallel and len(gpu_devices) > 1 and len(indexed_representations) > 1:
+            with ThreadPoolExecutor(max_workers=len(gpu_devices)) as pool:
+                contributions = list(pool.map(barycenter_contribution, indexed_representations))
+        else:
+            contributions = [barycenter_contribution(item) for item in indexed_representations]
+
+        numerator = torch.stack([item[0] for item in contributions]).mean(dim=0)
+        denominator = torch.stack([item[1] for item in contributions]).mean(dim=0)
+        next_barycenter = numerator / denominator.clamp_min(torch.finfo(barycenter.dtype).eps)
+        return next_barycenter.detach().cpu().numpy()
+
+    def _procrustes_gpu(self, embedding_source, embedding_target, OT, device: str):
+        source = self._as_barycenter_tensor(embedding_source, device)
+        target = self._as_barycenter_tensor(embedding_target, device)
+        ot_plan = self._as_barycenter_tensor(OT, device)
+
+        if target.shape[1] != source.shape[1]:
+            print("embedding_target and embedding_source have different dimensions.")
+            return None
+
+        U, _, Vh = torch.linalg.svd(torch.matmul(source.T, torch.matmul(ot_plan, target)))
+        Q = torch.matmul(U, Vh)
+        return torch.matmul(source, Q).detach().cpu().numpy()
+
+    def _wasserstein_alignment_gpu(
+        self,
+        pairwise,
+        device: str,
+        gpu_reg: Optional[float],
+        gpu_reg_scale: float,
+        gpu_numItermax: Optional[int],
+        gpu_stopThr: Optional[float],
+    ):
+        with torch.cuda.device(device):
+            source = self._as_barycenter_tensor(pairwise.source.embedding, device)
+            target = self._as_barycenter_tensor(pairwise.target.embedding, device)
+            ot_plan, loss = self._sinkhorn_transport_gpu(
+                source,
+                target,
+                self.metric,
+                gpu_reg,
+                gpu_reg_scale,
+                gpu_numItermax,
+                gpu_stopThr,
+            )
+            new_embedding = self._procrustes_gpu(target, source, ot_plan, device)
+            return (
+                pairwise,
+                float(loss.detach().cpu()),
+                ot_plan.detach().cpu().numpy(),
+                new_embedding,
+            )
+
+    def _run_barycenter_alignment_gpu(
+        self,
+        pairwise_barycenters,
+        init_embedding,
+        n_iter: int,
+        gpu_devices: List[str],
+        gpu_reg: Optional[float],
+        gpu_reg_scale: float,
+        gpu_numItermax: Optional[int],
+        gpu_stopThr: Optional[float],
+        gpu_parallel: bool,
+    ):
+        print(f"Using GPU Sinkhorn barycenter alignment on devices: {', '.join(gpu_devices)}")
+
+        loss_list = []
+        embedding_barycenter = init_embedding
+        for i in tqdm(range(n_iter), desc="Barycenter alignment"):
+            embedding_barycenter = self._calc_barycenter_gpu(
+                embedding_barycenter,
+                gpu_devices,
+                gpu_reg,
+                gpu_reg_scale,
+                gpu_numItermax,
+                gpu_stopThr,
+                gpu_parallel,
+            )
+
+            for pairwise in pairwise_barycenters:
+                pairwise.target.embedding = embedding_barycenter
+
+            if gpu_parallel and len(gpu_devices) > 1 and len(pairwise_barycenters) > 1:
+                with ThreadPoolExecutor(max_workers=len(gpu_devices)) as pool:
+                    futures = [
+                        pool.submit(
+                            self._wasserstein_alignment_gpu,
+                            pairwise,
+                            gpu_devices[index % len(gpu_devices)],
+                            gpu_reg,
+                            gpu_reg_scale,
+                            gpu_numItermax,
+                            gpu_stopThr,
+                        )
+                        for index, pairwise in enumerate(pairwise_barycenters)
+                    ]
+                    results = [future.result() for future in as_completed(futures)]
+            else:
+                results = [
+                    self._wasserstein_alignment_gpu(
+                        pairwise,
+                        gpu_devices[index % len(gpu_devices)],
+                        gpu_reg,
+                        gpu_reg_scale,
+                        gpu_numItermax,
+                        gpu_stopThr,
+                    )
+                    for index, pairwise in enumerate(pairwise_barycenters)
+                ]
+
+            loss = 0
+            for pairwise, pairwise_loss, ot_plan, new_embedding in results:
+                pairwise.OT = ot_plan
+                pairwise.source.embedding = new_embedding
+                loss += pairwise_loss
+
+            loss /= len(pairwise_barycenters)
+            loss_list.append(loss)
+            print(f"Iteration {i+1}/{n_iter} - Mean Sinkhorn distance: {loss:.4f}")
+
+        return loss_list
+
     def barycenter_alignment(
         self,
         pivot: int,
@@ -2754,6 +3044,13 @@ class AlignRepresentations:
         OT_format: str = "default",
         visualization_config: VisualizationConfig = VisualizationConfig(),
         fig_dir: Optional[str] = None,
+        use_gpu: bool = False,
+        gpu_devices: Optional[Union[int, str, List[int], List[str]]] = None,
+        gpu_reg: Optional[float] = None,
+        gpu_reg_scale: float = 5e-2,
+        gpu_numItermax: Optional[int] = None,
+        gpu_stopThr: Optional[float] = None,
+        gpu_parallel: bool = True,
     ) -> Optional[List[np.ndarray]]:
         """The unuspervised alignment method using Wasserstein barycenter proposed by Lian et al. (2021).
 
@@ -2771,6 +3068,20 @@ class AlignRepresentations:
                 Container of parameters used for figure. Defaults to VisualizationConfig().
             fig_dir (Optional[str], optional):
                 Directory where figures are saved. Defaults to None.
+            use_gpu (bool, optional):
+                If True, uses an approximate Sinkhorn barycenter path on CUDA. Defaults to False.
+            gpu_devices (Optional[Union[int, str, List[int], List[str]]], optional):
+                CUDA devices used by the GPU Sinkhorn path. If None, devices are inferred from the config.
+            gpu_reg (Optional[float], optional):
+                Sinkhorn regularization for the GPU path. If None, it is scaled from the cost matrix.
+            gpu_reg_scale (float, optional):
+                Multiplier for the median positive cost when gpu_reg is None. Defaults to 5e-2.
+            gpu_numItermax (Optional[int], optional):
+                Maximum Sinkhorn iterations for the GPU path. Defaults to config.numItermax.
+            gpu_stopThr (Optional[float], optional):
+                Stop threshold for the GPU Sinkhorn solves. Defaults to max(config.tol, 1e-7).
+            gpu_parallel (bool, optional):
+                If True, distributes independent Sinkhorn solves across gpu_devices. Defaults to True.
 
         Returns:
             Optional[List[np.ndarray]]:
@@ -2778,6 +3089,9 @@ class AlignRepresentations:
         """
 
         assert self.pairwise_method == "combination", "pairwise_method must be 'combination'."
+        resolved_gpu_devices = None
+        if use_gpu:
+            resolved_gpu_devices = self._resolve_barycenter_gpu_devices(gpu_devices)
         
         # Select the pivot
         pivot_representation = self.representations_list[pivot]
@@ -2816,6 +3130,7 @@ class AlignRepresentations:
             
 
         # Set up barycenter
+        print(f"Calculating barycenter...")
         init_embedding = self.calc_barycenter()
         self.barycenter = Representation(
             name="barycenter",
@@ -2828,6 +3143,7 @@ class AlignRepresentations:
             save_conditional_rdm_path=pivot_representation.save_conditional_rdm_path,
 
         )
+        print(f"Barycenter: {self.barycenter.name}")
 
         # Set pairwises whose target are the barycenter
         pairwise_barycenters = []
@@ -2849,26 +3165,39 @@ class AlignRepresentations:
             pairwise_barycenters.append(pairwise)
 
         # Barycenter alignment
-        loss_list = []
-        embedding_barycenter = init_embedding
-        for i in tqdm(range(n_iter), desc="Barycenter alignment"):
-            embedding_barycenter = self.calc_barycenter(X_init=embedding_barycenter)
+        if use_gpu:
+            loss_list = self._run_barycenter_alignment_gpu(
+                pairwise_barycenters,
+                init_embedding,
+                n_iter,
+                resolved_gpu_devices,
+                gpu_reg,
+                gpu_reg_scale,
+                gpu_numItermax,
+                gpu_stopThr,
+                gpu_parallel,
+            )
+        else:
+            loss_list = []
+            embedding_barycenter = init_embedding
+            for i in tqdm(range(n_iter), desc="Barycenter alignment"):
+                embedding_barycenter = self.calc_barycenter(X_init=embedding_barycenter)
 
-            loss = 0
-            for pairwise in pairwise_barycenters:
-                # update the embedding of the barycenter
-                pairwise.target.embedding = embedding_barycenter
+                loss = 0
+                for pairwise in pairwise_barycenters:
+                    # update the embedding of the barycenter
+                    pairwise.target.embedding = embedding_barycenter
 
-                # OT to the barycenter
-                loss += pairwise.wasserstein_alignment(metric=self.metric)
+                    # OT to the barycenter
+                    loss += pairwise.wasserstein_alignment(metric=self.metric)
 
-                # update the embeddings of each representation
-                pairwise.source.embedding = pairwise.get_new_source_embedding()
+                    # update the embeddings of each representation
+                    pairwise.source.embedding = pairwise.get_new_source_embedding()
 
-            loss /= len(pairwise_barycenters)
-            loss_list.append(loss)
+                loss /= len(pairwise_barycenters)
+                loss_list.append(loss)
 
-            print(f"Iteration {i+1}/{n_iter} - Mean Wasserstein distance: {loss:.4f}")
+                print(f"Iteration {i+1}/{n_iter} - Mean Wasserstein distance: {loss:.4f}")
 
         plt.figure()
         plt.plot(loss_list)

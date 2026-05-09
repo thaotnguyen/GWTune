@@ -6,7 +6,43 @@ from typing import Any, Dict, Optional, List
 
 import numpy as np
 import optuna
+from optuna.study import StudyDirection
+from optuna.trial import TrialState
 from sqlalchemy_utils import create_database, database_exists
+
+
+class _NoImprovementEarlyStoppingCallback:
+    """Stop the study when the best objective fails to improve for ``patience`` completed trials."""
+
+    def __init__(self, patience: int, min_completed_trials: int) -> None:
+        self._patience = max(1, patience)
+        self._min_completed_trials = max(1, min_completed_trials)
+        self._best_value: Optional[float] = None
+        self._no_improve_count = 0
+
+    def __call__(self, study: optuna.study.Study, trial: optuna.trial.FrozenTrial) -> None:
+        if trial.state != TrialState.COMPLETE:
+            return
+        n_complete = sum(1 for t in study.trials if t.state == TrialState.COMPLETE)
+        if n_complete < self._min_completed_trials:
+            return
+        best = study.best_value
+        if best is None:
+            return
+        if self._best_value is None:
+            self._best_value = best
+            return
+        if study.direction == StudyDirection.MAXIMIZE:
+            improved = best > self._best_value + 1e-12
+        else:
+            improved = best < self._best_value - 1e-12
+        if improved:
+            self._best_value = best
+            self._no_improve_count = 0
+        else:
+            self._no_improve_count += 1
+            if self._no_improve_count >= self._patience:
+                study.stop()
 
 
 # %%
@@ -45,7 +81,10 @@ class RunOptuna:
         n_jobs: int,
         sampler_name: str,
         pruner_name: str,
-        pruner_params: Optional[dict] = None
+        pruner_params: Optional[dict] = None,
+        early_stopping_patience: Optional[int] = None,
+        early_stopping_min_trials: int = 15,
+        max_total_trials: Optional[int] = None,
     ) -> None:
         """Initialize the RunOptuna class which serves as a utility for handling and running Optuna studies.
 
@@ -60,6 +99,12 @@ class RunOptuna:
             sampler_name (str): Name of the sampler used in optimization. Options are "random", "grid", and "tpe".
             pruner_name (str):  Name of the pruner used in optimization. Options are "hyperband", "median", and "nop".
             pruner_params (Optional[dict], optional): Additional parameters for the pruner. See Optuna's pruner page for more details. Defaults to None.
+            early_stopping_patience (Optional[int], optional): If set, stop the study after this many
+                consecutive completed trials without improving the best value. Defaults to None (disabled).
+            early_stopping_min_trials (int, optional): Minimum number of completed trials before early
+                stopping is allowed. Defaults to 15.
+            max_total_trials (Optional[int], optional): If set, cap the total number of persisted Optuna
+                trial rows for the study, including completed, pruned, failed, and running trials.
         """
 
         # the path or file name to save the results.
@@ -76,7 +121,9 @@ class RunOptuna:
         self.sampler_name = sampler_name
         self.pruner_name = pruner_name
         self.pruner_params = pruner_params
-
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_min_trials = early_stopping_min_trials
+        self.max_total_trials = max_total_trials
 
         # parameters for optuna.study
         self.n_jobs = n_jobs
@@ -113,7 +160,7 @@ class RunOptuna:
             else:
                 print(f"{key} is not a parameter of the pruner.")
 
-    def create_study(self, direction: str = "minimize") -> optuna.study.Study:
+    def create_study(self, direction: str = "minimize", seed: int = 42) -> optuna.study.Study:
         """Create a new Optuna study.
 
         This method initializes a new study for the optimization process.
@@ -122,6 +169,7 @@ class RunOptuna:
         Args:
             direction (str, optional): Optimization direction for the study. Either "minimize" for minimization problems or
                                        "maximize" for maximization problems. Defaults to "minimize".
+            seed (int, optional): Seed for the sampler when creating a new study. Defaults to 42.
 
         Returns:
             optuna.study.Study: Initialized Optuna study.
@@ -131,6 +179,8 @@ class RunOptuna:
             study_name=self.filename + "_" + self.init_mat_plan,
             storage=self.storage,
             load_if_exists=True,
+            sampler=self.choose_sampler(seed=seed, constant_liar=(self.n_jobs > 1)),
+            pruner=self.choose_pruner(),
         )
         return study
 
@@ -150,7 +200,7 @@ class RunOptuna:
         if compute_OT:
             study = optuna.load_study(
                 study_name=self.filename + "_" + self.init_mat_plan,
-                sampler=self.choose_sampler(seed=seed),
+                sampler=self.choose_sampler(seed=seed, constant_liar=(self.n_jobs > 1)),
                 pruner=self.choose_pruner(),
                 storage=self.storage,
             )
@@ -197,10 +247,22 @@ class RunOptuna:
             study = self.load_study(seed=seed)
         except KeyError:
             print("Study for " + self.filename + "_" + self.init_mat_plan + " was not found, creating a new one...")
-            self.create_study()
+            self.create_study(seed=seed)
             study = self.load_study(seed=seed)
 
         objective = functools.partial(objective, **kwargs)
+
+        n_trials = self.num_trial
+        if self.max_total_trials is not None:
+            remaining_trials = max(0, self.max_total_trials - len(study.trials))
+            if remaining_trials == 0:
+                print(
+                    f"Study {self.filename}_{self.init_mat_plan} already has "
+                    f"{len(study.trials)} trials; skipping because max_total_trials="
+                    f"{self.max_total_trials}."
+                )
+                return study
+            n_trials = min(n_trials, remaining_trials)
 
         if self.n_jobs > 1:
             warnings.filterwarnings("always")
@@ -211,7 +273,21 @@ class RunOptuna:
             )
             warnings.filterwarnings("ignore")
 
-        study.optimize(objective, self.num_trial, n_jobs=self.n_jobs)
+        callbacks: List[Any] = []
+        if self.early_stopping_patience is not None and self.early_stopping_patience > 0:
+            callbacks.append(
+                _NoImprovementEarlyStoppingCallback(
+                    patience=self.early_stopping_patience,
+                    min_completed_trials=self.early_stopping_min_trials,
+                )
+            )
+
+        study.optimize(
+            objective,
+            n_trials,
+            n_jobs=self.n_jobs,
+            callbacks=callbacks or None,
+        )
 
         return study
 
@@ -299,6 +375,9 @@ def load_optimizer(
     sampler_name: str = "random",
     pruner_name: str = "median",
     pruner_params: Optional[Dict[str, Any]] = None,
+    early_stopping_patience: Optional[int] = None,
+    early_stopping_min_trials: int = 15,
+    max_total_trials: Optional[int] = None,
 ) -> RunOptuna:
     """Loads and initializes the optimizer for hyperparameter tuning.
 
@@ -321,6 +400,9 @@ def load_optimizer(
         sampler_name (str, optional): Name of the sampler used in optimization. Options are "random", "grid", and "tpe". Defaults to "random".
         pruner_name (str, optional): Name of the pruner used in optimization. Options are "hyperband", "median", and "nop". Defaults to "median".
         pruner_params (dict, optional): Additional parameters for the pruner. See Optuna's pruner page for more details
+        early_stopping_patience (int, optional): Stop after this many completed trials without improving the best value.
+        early_stopping_min_trials (int, optional): Minimum completed trials before early stopping applies.
+        max_total_trials (int, optional): Cap total persisted Optuna trial rows for the study.
 
     Returns:
         opt : instance of optimzer.
@@ -345,6 +427,9 @@ def load_optimizer(
             sampler_name,
             pruner_name,
             pruner_params,
+            early_stopping_patience=early_stopping_patience,
+            early_stopping_min_trials=early_stopping_min_trials,
+            max_total_trials=max_total_trials,
         )
     else:
         raise ValueError("no implemented method.")
